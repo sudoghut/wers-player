@@ -2,6 +2,7 @@ import argparse
 import configparser
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -68,6 +69,59 @@ def _kill_process_tree(pid: int) -> None:
             pass
 
 
+def _parse_stream_title(line: str) -> str:
+    """Extract the song title from an ICY metadata line."""
+    # Format: StreamTitle='Artist - Song'
+    match = re.search(r"StreamTitle='([^']*)'", line)
+    if match:
+        return match.group(1).strip()
+    # Format from ffplay metadata: "    StreamTitle     : Artist - Song"
+    match = re.search(r"StreamTitle\s*:\s*(.+)", line)
+    if match:
+        return match.group(1).strip()
+    # Some streams use "icy-title:" header
+    lower = line.lower()
+    if "icy-title" in lower:
+        idx = lower.index("icy-title")
+        rest = line[idx:]
+        if ":" in rest:
+            return rest.split(":", 1)[1].strip().strip("'\"")
+    return ""
+
+
+def _process_ffplay_line(
+    line: str,
+    recent_lines: deque[str],
+    last_title: str,
+) -> str | None:
+    """Process one line of ffplay stderr. Returns new title if changed."""
+    # Strip ANSI escape codes
+    line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\[2K", "", line).rstrip()
+    if not line:
+        return None
+    # Skip ffplay progress/status lines
+    if re.match(r"\s*[\d.nan-]+\s+(M-A:|   :\s)", line):
+        return None
+    # Extract and display ICY metadata (song title)
+    if "StreamTitle" in line:
+        title = _parse_stream_title(line)
+        if title and title != last_title:
+            logging.info("now playing: %s", title)
+            return title
+        return None
+    # Log stream info at debug level
+    if re.match(r"\s*(Input #|Duration:|Stream #|Metadata:)", line):
+        logging.debug("ffplay: %s", line)
+        return None
+    # Skip icy header lines
+    if re.match(r"\s*icy-", line, re.IGNORECASE):
+        logging.debug("ffplay: %s", line)
+        return None
+    recent_lines.append(line)
+    logging.warning("ffplay: %s", line)
+    return None
+
+
 class FfplayProcess:
     def __init__(self, ffplay_path: str, extra_args: Iterable[str]) -> None:
         self.ffplay_path = ffplay_path
@@ -79,7 +133,7 @@ class FfplayProcess:
             self.ffplay_path,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            "info",
             "-nodisp",
             "-vn",
             "-autoexit",
@@ -101,12 +155,27 @@ class FfplayProcess:
 
         def drain_stderr() -> None:
             assert process.stderr is not None
-            for raw_line in process.stderr:
-                line = raw_line.rstrip()
-                if not line:
-                    continue
-                recent_lines.append(line)
-                logging.warning("ffplay: %s", line)
+            last_title = ""
+            buf = ""
+            while True:
+                chunk = process.stderr.read(1)
+                if not chunk:
+                    # Process ended — flush remaining buffer
+                    if buf.strip():
+                        _process_ffplay_line(buf, recent_lines, last_title)
+                    break
+                buf += chunk
+                # Split on both \r and \n since ffplay uses \r for progress
+                if chunk in ("\r", "\n"):
+                    line = buf.rstrip()
+                    buf = ""
+                    if not line:
+                        continue
+                    new_title = _process_ffplay_line(
+                        line, recent_lines, last_title,
+                    )
+                    if new_title:
+                        last_title = new_title
 
         thread = threading.Thread(target=drain_stderr, daemon=True)
         thread.start()
