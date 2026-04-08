@@ -1,5 +1,6 @@
 import argparse
 import configparser
+import http.client
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ from collections import deque
 from pathlib import Path
 from typing import Iterable
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
@@ -69,57 +71,100 @@ def _kill_process_tree(pid: int) -> None:
             pass
 
 
-def _parse_stream_title(line: str) -> str:
-    """Extract the song title from an ICY metadata line."""
-    # Format: StreamTitle='Artist - Song'
-    match = re.search(r"StreamTitle='([^']*)'", line)
-    if match:
-        return match.group(1).strip()
-    # Format from ffplay metadata: "    StreamTitle     : Artist - Song"
-    match = re.search(r"StreamTitle\s*:\s*(.+)", line)
-    if match:
-        return match.group(1).strip()
-    # Some streams use "icy-title:" header
-    lower = line.lower()
-    if "icy-title" in lower:
-        idx = lower.index("icy-title")
-        rest = line[idx:]
-        if ":" in rest:
-            return rest.split(":", 1)[1].strip().strip("'\"")
-    return ""
 
+class IcyMetadataMonitor:
+    """Monitors ICY metadata from a stream URL in a background thread."""
 
-def _process_ffplay_line(
-    line: str,
-    recent_lines: deque[str],
-    last_title: str,
-) -> str | None:
-    """Process one line of ffplay stderr. Returns new title if changed."""
-    # Strip ANSI escape codes
-    line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\[2K", "", line).rstrip()
-    if not line:
-        return None
-    # Skip ffplay progress/status lines
-    if re.match(r"\s*[\d.nan-]+\s+(M-A:|   :\s)", line):
-        return None
-    # Extract and display ICY metadata (song title)
-    if "StreamTitle" in line:
-        title = _parse_stream_title(line)
-        if title and title != last_title:
-            logging.info("now playing: %s", title)
-            return title
-        return None
-    # Log stream info at debug level
-    if re.match(r"\s*(Input #|Duration:|Stream #|Metadata:)", line):
-        logging.debug("ffplay: %s", line)
-        return None
-    # Skip icy header lines
-    if re.match(r"\s*icy-", line, re.IGNORECASE):
-        logging.debug("ffplay: %s", line)
-        return None
-    recent_lines.append(line)
-    logging.warning("ffplay: %s", line)
-    return None
+    def __init__(self, user_agent: str) -> None:
+        self.user_agent = user_agent
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_title = ""
+
+    def start(self, stream_url: str) -> None:
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._monitor, args=(stream_url,), daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+
+    def _monitor(self, stream_url: str) -> None:
+        parsed = urlparse(stream_url)
+        use_ssl = parsed.scheme == "https"
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if use_ssl else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        try:
+            if use_ssl:
+                conn = http.client.HTTPSConnection(host, port, timeout=15)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=15)
+
+            conn.request(
+                "GET",
+                path,
+                headers={
+                    "User-Agent": self.user_agent,
+                    "Icy-MetaData": "1",
+                },
+            )
+            resp = conn.getresponse()
+            metaint_str = resp.getheader("icy-metaint")
+            if not metaint_str:
+                logging.debug("stream does not support ICY metadata")
+                return
+            metaint = int(metaint_str)
+            logging.debug("ICY metaint: %d bytes", metaint)
+
+            while not self._stop.is_set():
+                # Skip audio data
+                remaining = metaint
+                while remaining > 0 and not self._stop.is_set():
+                    chunk = resp.read(min(remaining, 4096))
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
+
+                # Read metadata length byte
+                length_byte = resp.read(1)
+                if not length_byte:
+                    return
+                meta_length = length_byte[0] * 16
+                if meta_length == 0:
+                    continue
+
+                # Read metadata
+                meta_data = resp.read(meta_length)
+                if not meta_data:
+                    return
+                meta_str = meta_data.decode("utf-8", errors="replace").rstrip("\x00")
+                match = re.search(r"StreamTitle='([^']*)'", meta_str)
+                if match:
+                    title = match.group(1).strip()
+                    # Skip station identification (e.g. "WERS - Boston")
+                    if title and title.upper().startswith("WERS"):
+                        continue
+                    if title and title != self._last_title:
+                        self._last_title = title
+                        logging.info("now playing: %s", title)
+        except Exception:
+            if not self._stop.is_set():
+                logging.debug("ICY metadata monitor disconnected", exc_info=True)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class FfplayProcess:
@@ -133,7 +178,7 @@ class FfplayProcess:
             self.ffplay_path,
             "-hide_banner",
             "-loglevel",
-            "info",
+            "warning",
             "-nodisp",
             "-vn",
             "-autoexit",
@@ -155,27 +200,12 @@ class FfplayProcess:
 
         def drain_stderr() -> None:
             assert process.stderr is not None
-            last_title = ""
-            buf = ""
-            while True:
-                chunk = process.stderr.read(1)
-                if not chunk:
-                    # Process ended — flush remaining buffer
-                    if buf.strip():
-                        _process_ffplay_line(buf, recent_lines, last_title)
-                    break
-                buf += chunk
-                # Split on both \r and \n since ffplay uses \r for progress
-                if chunk in ("\r", "\n"):
-                    line = buf.rstrip()
-                    buf = ""
-                    if not line:
-                        continue
-                    new_title = _process_ffplay_line(
-                        line, recent_lines, last_title,
-                    )
-                    if new_title:
-                        last_title = new_title
+            for raw_line in process.stderr:
+                line = raw_line.rstrip()
+                if not line:
+                    continue
+                recent_lines.append(line)
+                logging.warning("ffplay: %s", line)
 
         thread = threading.Thread(target=drain_stderr, daemon=True)
         thread.start()
@@ -187,12 +217,14 @@ class PlayerLoop:
         self,
         resolver: StreamResolver,
         ffplay: FfplayProcess,
+        icy_monitor: IcyMetadataMonitor,
         reconnect_delay: float,
         max_reconnect_delay: float,
         healthy_run_seconds: float,
     ) -> None:
         self.resolver = resolver
         self.ffplay = ffplay
+        self.icy_monitor = icy_monitor
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
         self.healthy_run_seconds = healthy_run_seconds
@@ -201,6 +233,7 @@ class PlayerLoop:
 
     def stop(self) -> None:
         self._stop.set()
+        self.icy_monitor.stop()
         if self._process and self._process.poll() is None:
             logging.info("stopping ffplay")
             _kill_process_tree(self._process.pid)
@@ -226,9 +259,11 @@ class PlayerLoop:
                     break
                 logging.info("starting candidate %s/%s: %s", index, len(candidates), stream_url)
                 start_time = time.monotonic()
+                self.icy_monitor.start(stream_url)
                 process, recent_lines = self.ffplay.start(stream_url)
                 self._process = process
                 return_code = process.wait()
+                self.icy_monitor.stop()
                 # Ensure the entire process tree is cleaned up (the shim
                 # may have exited while the real ffplay child is still alive).
                 _kill_process_tree(process.pid)
@@ -416,9 +451,11 @@ def main() -> int:
         user_agent=args.user_agent,
     )
     ffplay = FfplayProcess(ffplay_path=ffplay_path, extra_args=args.ffplay_arg)
+    icy_monitor = IcyMetadataMonitor(user_agent=args.user_agent)
     loop = PlayerLoop(
         resolver=resolver,
         ffplay=ffplay,
+        icy_monitor=icy_monitor,
         reconnect_delay=args.reconnect_delay,
         max_reconnect_delay=args.max_reconnect_delay,
         healthy_run_seconds=args.healthy_run_seconds,
