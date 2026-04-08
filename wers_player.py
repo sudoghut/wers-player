@@ -1,6 +1,7 @@
 import argparse
 import configparser
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -51,6 +52,22 @@ class StreamResolver:
         return urls
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its children."""
+    if sys.platform == "win32":
+        # taskkill /T kills the entire process tree
+        subprocess.call(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+
+
 class FfplayProcess:
     def __init__(self, ffplay_path: str, extra_args: Iterable[str]) -> None:
         self.ffplay_path = ffplay_path
@@ -69,8 +86,7 @@ class FfplayProcess:
             *self.extra_args,
             stream_url,
         ]
-        process = subprocess.Popen(
-            command,
+        kwargs: dict = dict(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -79,6 +95,9 @@ class FfplayProcess:
             errors="replace",
             bufsize=1,
         )
+        if sys.platform != "win32":
+            kwargs["start_new_session"] = True
+        process = subprocess.Popen(command, **kwargs)
 
         def drain_stderr() -> None:
             assert process.stderr is not None
@@ -115,7 +134,7 @@ class PlayerLoop:
         self._stop.set()
         if self._process and self._process.poll() is None:
             logging.info("stopping ffplay")
-            self._process.terminate()
+            _kill_process_tree(self._process.pid)
 
     def run(self) -> int:
         delay = self.reconnect_delay
@@ -141,6 +160,9 @@ class PlayerLoop:
                 process, recent_lines = self.ffplay.start(stream_url)
                 self._process = process
                 return_code = process.wait()
+                # Ensure the entire process tree is cleaned up (the shim
+                # may have exited while the real ffplay child is still alive).
+                _kill_process_tree(process.pid)
                 self._process = None
                 runtime = time.monotonic() - start_time
 
