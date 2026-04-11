@@ -80,10 +80,16 @@ class IcyMetadataMonitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_title = ""
+        self._last_activity = 0.0
+        self._metadata_available = False
+        self._state_lock = threading.Lock()
 
     def start(self, stream_url: str) -> None:
         self.stop()
         self._stop.clear()
+        with self._state_lock:
+            self._last_activity = time.monotonic()
+            self._metadata_available = False
         self._thread = threading.Thread(
             target=self._monitor, args=(stream_url,), daemon=True
         )
@@ -94,6 +100,16 @@ class IcyMetadataMonitor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self._thread = None
+
+    def stalled_for(self) -> float | None:
+        with self._state_lock:
+            if not self._metadata_available:
+                return None
+            return max(0.0, time.monotonic() - self._last_activity)
+
+    def _mark_activity(self) -> None:
+        with self._state_lock:
+            self._last_activity = time.monotonic()
 
     def _monitor(self, stream_url: str) -> None:
         parsed = urlparse(stream_url)
@@ -123,6 +139,9 @@ class IcyMetadataMonitor:
             if not metaint_str:
                 logging.debug("stream does not support ICY metadata")
                 return
+            with self._state_lock:
+                self._metadata_available = True
+                self._last_activity = time.monotonic()
             metaint = int(metaint_str)
             logging.debug("ICY metaint: %d bytes", metaint)
 
@@ -134,11 +153,13 @@ class IcyMetadataMonitor:
                     if not chunk:
                         return
                     remaining -= len(chunk)
+                    self._mark_activity()
 
                 # Read metadata length byte
                 length_byte = resp.read(1)
                 if not length_byte:
                     return
+                self._mark_activity()
                 meta_length = length_byte[0] * 16
                 if meta_length == 0:
                     continue
@@ -147,6 +168,7 @@ class IcyMetadataMonitor:
                 meta_data = resp.read(meta_length)
                 if not meta_data:
                     return
+                self._mark_activity()
                 meta_str = meta_data.decode("utf-8", errors="replace").rstrip("\x00")
                 match = re.search(r"StreamTitle='([^']*)'", meta_str)
                 if match:
@@ -221,6 +243,7 @@ class PlayerLoop:
         reconnect_delay: float,
         max_reconnect_delay: float,
         healthy_run_seconds: float,
+        stalled_stream_seconds: float,
     ) -> None:
         self.resolver = resolver
         self.ffplay = ffplay
@@ -228,6 +251,7 @@ class PlayerLoop:
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
         self.healthy_run_seconds = healthy_run_seconds
+        self.stalled_stream_seconds = stalled_stream_seconds
         self._stop = threading.Event()
         self._process: subprocess.Popen[str] | None = None
 
@@ -262,7 +286,7 @@ class PlayerLoop:
                 self.icy_monitor.start(stream_url)
                 process, recent_lines = self.ffplay.start(stream_url)
                 self._process = process
-                return_code = process.wait()
+                return_code = self._wait_for_process(process)
                 self.icy_monitor.stop()
                 # Ensure the entire process tree is cleaned up (the shim
                 # may have exited while the real ffplay child is still alive).
@@ -306,6 +330,33 @@ class PlayerLoop:
 
         return 0
 
+    def _wait_for_process(self, process: subprocess.Popen[str]) -> int:
+        stalled_restart_requested = False
+        while not self._stop.is_set():
+            return_code = process.poll()
+            if return_code is not None:
+                return return_code
+
+            stalled_for = self.icy_monitor.stalled_for()
+            if (
+                stalled_for is not None
+                and stalled_for >= self.stalled_stream_seconds
+            ):
+                logging.warning(
+                    "stream appears stalled after %.1f seconds without ICY activity; restarting ffplay",
+                    stalled_for,
+                )
+                _kill_process_tree(process.pid)
+                stalled_restart_requested = True
+
+            if stalled_restart_requested:
+                return process.wait()
+
+            time.sleep(1)
+
+        _kill_process_tree(process.pid)
+        return process.wait()
+
     def _sleep_with_stop(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
         while not self._stop.is_set():
@@ -323,7 +374,32 @@ def choose_ffplay(explicit_path: str | None) -> str:
         raise FileNotFoundError(
             "ffplay was not found in PATH. Install FFmpeg or pass --ffplay-path."
         )
-    return discovered
+    resolved = _resolve_real_ffplay(Path(discovered))
+    if resolved != discovered:
+        logging.info("resolved Chocolatey ffplay shim %s to %s", discovered, resolved)
+    return resolved
+
+
+def _resolve_real_ffplay(discovered_path: Path) -> str:
+    if sys.platform != "win32":
+        return str(discovered_path)
+    normalized = str(discovered_path).lower()
+    if "\\chocolatey\\bin\\ffplay.exe" not in normalized:
+        return str(discovered_path)
+    # Chocolatey's ffmpeg package commonly exposes a shim in bin\ and the
+    # actual executable under lib\ffmpeg\tools\ffmpeg\bin\.
+    real_path = (
+        discovered_path.parent.parent
+        / "lib"
+        / "ffmpeg"
+        / "tools"
+        / "ffmpeg"
+        / "bin"
+        / "ffplay.exe"
+    )
+    if real_path.exists():
+        return str(real_path)
+    return str(discovered_path)
 
 
 def configure_logging(log_file: Path, verbose: bool) -> None:
@@ -382,6 +458,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="If playback lasts at least this long, reconnect immediately on the next drop.",
     )
     parser.add_argument(
+        "--stalled-stream-seconds",
+        type=float,
+        default=90.0,
+        help="Restart ffplay if the stream shows no ICY activity for this many seconds.",
+    )
+    parser.add_argument(
         "--log-file",
         default="logs/wers-player.log",
         help="Path to the log file.",
@@ -418,12 +500,17 @@ class FallbackResolver(StreamResolver):
 
     def resolve(self) -> list[str]:
         errors: list[str] = []
-        for url in [self.playlist_url, self.fallback_playlist_url]:
+        primary_url = self.playlist_url
+        for url in [primary_url, self.fallback_playlist_url]:
             if not url:
                 continue
-            self.playlist_url = url
             try:
-                urls = super().resolve()
+                resolver = StreamResolver(
+                    playlist_url=url,
+                    timeout=self.timeout,
+                    user_agent=self.user_agent,
+                )
+                urls = resolver.resolve()
                 logging.info("resolved playlist from %s", url)
                 return urls
             except Exception as exc:
@@ -459,6 +546,7 @@ def main() -> int:
         reconnect_delay=args.reconnect_delay,
         max_reconnect_delay=args.max_reconnect_delay,
         healthy_run_seconds=args.healthy_run_seconds,
+        stalled_stream_seconds=args.stalled_stream_seconds,
     )
 
     def handle_signal(_signum: int, _frame: object) -> None:
